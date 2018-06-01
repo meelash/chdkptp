@@ -1,5 +1,5 @@
 --[[
- Copyright (C) 2010-2017 <reyalp (at) gmail dot com>
+ Copyright (C) 2010-2018 <reyalp (at) gmail dot com>
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License version 2 as
@@ -520,6 +520,24 @@ function cli:get_shoot_common_opts(args)
 		end
 		opts.sd = util.round(sd*convert[units])
 	end
+	if args.sdmode then
+		if not args.sd then
+			return false,'sdmode requires sd'
+		end
+		if type(args.sdmode) ~= 'string' then
+			return false,'sdmode requires a value'
+		end
+		args.sdmode=string.upper(args.sdmode)
+		if not util.in_table({'AF','AFL','MF','NONE'},args.sdmode) then
+			return false,string.format('invalid sd mode %s',tostring(args.sdmode))
+		end
+		if args.sdmode == 'NONE' then
+			opts.sdprefmode=nil
+			opts.sdnoenable=true
+		else
+			opts.sdprefmode=args.sdmode
+		end
+	end
 
 	-- hack for CHDK override bug that ignores APEX 0
 	-- only used for CHDK 1.1 (API 2.4 and earlier)
@@ -540,10 +558,7 @@ function cli:get_luatext_arg(arg)
 	if not arg.input then
 		return arg.text
 	end
-	local fh = fsutil.open_e(arg.input,'rb')
-	local r=fh:read("*a")
-	fh:close()
-	return r
+	return fsutil.readfile_e(arg.input,'b')
 end
 
 --[[
@@ -2053,6 +2068,7 @@ Standard string substitutions
 			isomode=false,
 			nd=false,
 			sd=false,
+			sdmode=false,
 			raw=false,
 			dng=false,
 			pretend=false,
@@ -2061,7 +2077,7 @@ Standard string substitutions
 			rm=false,
 			seq=false,
 		}),
-		-- TODO allow setting destinations and filetypes for -dl
+		-- TODO allow filetypes for -dl
 		-- TODO should support canon native raw
 		help_detail=[[
  options:
@@ -2075,7 +2091,11 @@ Standard string substitutions
    -av=<v>    Aperture value. In standard units, f number
    -isomode=<v> ISO mode, must be ISO value in Canon UI, shooting mode must have manual ISO
    -nd=<in|out> set ND filter state
-   -sd=<v>[units]  subject distance, units one of m, mm, in, ft default m
+   -sd=<v>[units]  subject distance (focus), units one of m, mm, in, ft default m
+   -sdmode=<mode> prefer <mode> for SD override, one of AF, AFL, MF, NONE
+                  if NONE, override will be ignored if not supported in current mode
+                  if not given, the current camera mode is preferred
+                  if port requires a different mode for SD override, it will be used
    -raw[=1|0] Force raw on or off, defaults to current camera setting
    -dng[=1|0] Force DNG on or off, implies raw if on, default current camera setting
    -pretend   print actions instead of running them
@@ -2278,6 +2298,7 @@ rlib_wait_timeout(
 			isomode=false,
 			nd=false,
 			sd=false,
+			sdmode=false,
 			jpg=false,
 			raw=false,
 			dng=false,
@@ -2293,6 +2314,7 @@ rlib_wait_timeout(
 			jpgdummy=false,
 			nosubst=false,
 			seq=false,
+			script=false,
 		},
 		help_detail=[[
  [dest] path/name specification for saved files
@@ -2312,7 +2334,11 @@ rlib_wait_timeout(
    -av=<v>    Aperture value. In standard units, f number
    -isomode=<v> ISO mode, must be ISO value in Canon UI, shooting mode must have manual ISO
    -nd=<in|out> set ND filter state
-   -sd=<v>[units]  subject distance, units one of m, mm, in, ft default m
+   -sd=<v>[units]  subject distance (focus), units one of m, mm, in, ft default m
+   -sdmode=<mode> prefer <mode> for SD override, one of AF, AFL, MF, NONE
+                  if NONE, override will be ignored if not supported in current mode
+                  if not given, the current camera mode is preferred
+                  if port requires a different mode for SD override, it will be used
    -jpg         jpeg, default if no other options (not supported on all cams)
    -raw         framebuffer dump raw
    -dng         DNG format raw
@@ -2328,6 +2354,7 @@ rlib_wait_timeout(
    -jpgdummy	write dummy IMG_nnnn.JPG to avoid play / shutdown crash on some cams
    -nosubst     don't do pattern substitution on file names
    -seq=<n>     initial value for shotseq subst string, default cli_shotseq
+   -script=<filename> use local file <filename> for shooting script
 
 Substitutions
 ${serial}         camera serial number, or empty if not available
@@ -2434,6 +2461,10 @@ Standard string substitutions
 					opts.shots = 1
 				end
 			end
+			local shootscript
+			if args.script then
+				shootscript=fsutil.readfile_e(args.script,'b')
+			end
 
 			-- convert to integer ms
 			if args.int then
@@ -2447,9 +2478,14 @@ Standard string substitutions
 				return false,rerr
 			end
 
-			cli.dbgmsg('rs_shoot\n')
-			-- TODO script errors will not get picked up here
-			con:exec('rs_shoot('..opts_s..')',{libs={'rs_shoot'}})
+			if shootscript then
+				cli.dbgmsg('rs script %s\n',args.script)
+				con:exec('rs_opts='..opts_s..' '..shootscript,{libs={'rs_shoot'}})
+			else
+				cli.dbgmsg('rs_shoot\n')
+				-- TODO script errors will not get picked up here
+				con:exec('rs_shoot('..opts_s..')',{libs={'rs_shoot'}})
+			end
 
 			local rcopts=chdku.rc_init_std_handlers{
 				jpg=args.jpg,
@@ -2466,11 +2502,17 @@ Standard string substitutions
 
 			if args.shotwait then
 				rcopts.timeout=tonumber(args.shotwait)
-			elseif opts.tv then -- opts.tv is normalized to a tv96 value
-				-- 2x to allow for dark frame if enabled
-				rcopts.timeout=10000 + 2*exp.tv96_to_shutter(opts.tv)*1000
 			else
-				rcopts.timeout=20000
+				if opts.tv then -- opts.tv is normalized to a tv96 value
+					-- 2x to allow for dark frame if enabled
+					rcopts.timeout=10000 + 2*exp.tv96_to_shutter(opts.tv)*1000
+				else
+					rcopts.timeout=20000
+				end
+				-- ensure timeout is longer than interval
+				if opts.int and rcopts.timeout < opts.int + 10000 then
+					rcopts.timeout = opts.int + 10000 
+				end
 			end
 			if args.seq then
 				prefs.cli_shotseq = tonumber(args.seq)
@@ -2490,6 +2532,8 @@ Standard string substitutions
 				end
 				shot = shot + 1
 				prefs.cli_shotseq = prefs.cli_shotseq+1
+				collectgarbage('collect') -- keep uncollected lbufs from building up
+										  -- TODO should be done in a generic way in wait_status / cli prompt?
 			until shot > opts.shots
 
 			local t0=ustime.new()
@@ -2552,6 +2596,7 @@ Standard string substitutions
 			isomode=false,
 			nd=false,
 			sd=false,
+			sdmode=false,
 			jpg=false,
 			raw=false,
 			dng=false,
@@ -2585,7 +2630,11 @@ Standard string substitutions
    -av=<v>    Aperture value. In standard units, f number
    -isomode=<v> ISO mode, must be ISO value in Canon UI, shooting mode must have manual ISO
    -nd=<in|out> set ND filter state
-   -sd=<v>[units]  subject distance, units one of m, mm, in, ft default m
+   -sd=<v>[units]  subject distance (focus), units one of m, mm, in, ft default m
+   -sdmode=<mode> prefer <mode> for SD override, one of AF, AFL, MF
+                  if NONE, override will be ignored if not supported in current mode
+                  if not given, the current camera mode is preferred
+                  if port requires a different mode for SD override, it will be used
    -jpg         jpeg, default if no other options (not supported on all cams)
    -raw         framebuffer dump raw
    -dng         DNG format raw
